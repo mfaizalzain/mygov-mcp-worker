@@ -242,6 +242,86 @@ async function gtfsStaticSummary(agency, ttl = 0) {
   return summary;
 }
 
+/* ---- Rapid KL live bus feed (myrapidbus kiosk data source) ----
+ * The api.data.gov.my GTFS-RT feed for prasarana is frequently empty, but the
+ * official kiosk (myrapidbus.prasarana.com.my/kiosk) shows live buses from a
+ * socket.io server (rapidbus-socketio-avl.prasarana.com.my). socket.io's
+ * engine.io polling transport is plain HTTP, so a Worker can consume it:
+ *   1. GET  /socket.io/?EIO=4&transport=polling   -> 0{"sid":...}
+ *   2. POST 40{...} connect, POST 42["onFts-reload",{...}] emit
+ *   3. GET  poll -> 42["onFts-client","<base64(gzip(json))>"]
+ * Data shape per bus: bus_no, latitude, longitude, route, dir, speed, angle,
+ * dt_gps, dt_received, captain_id, trip_no, engine_status, accessibility.
+ */
+const RAPID_SID = "m0ckulfr515l5s79sgd2hhva9iqm3cr2"; // shared kiosk sid
+const RAPID_URL = "https://rapidbus-socketio-avl.prasarana.com.my/socket.io/";
+
+function b64decode(s) {
+  const bin = atob(s);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+
+async function rapidBusFeed(provider = "RKL", route = "") {
+  const t = Date.now();
+  // 1. open
+  const openRes = await fetch(`${RAPID_URL}?EIO=4&transport=polling&t=${t}`, {
+    headers: { "user-agent": UA },
+  });
+  if (!openRes.ok) throw new Error(`rapid open ${openRes.status}`);
+  const openText = await openRes.text();
+  const m = openText.match(/^0\{"sid":"([^"]+)"/);
+  if (!m) throw new Error(`rapid open handshake failed: ${openText.slice(0, 80)}`);
+  const sid = m[1];
+  // 2. connect + emit (two POSTs, same sid)
+  const post = async (payload) => {
+    const r = await fetch(`${RAPID_URL}?EIO=4&transport=polling&sid=${sid}&t=${Date.now()}`, {
+      method: "POST",
+      headers: { "content-type": "text/plain;charset=UTF-8", "user-agent": UA },
+      body: payload,
+    });
+    if (!r.ok) throw new Error(`rapid post ${r.status}`);
+  };
+  await post(`40{"sid":"${RAPID_SID}","uid":""}`);
+  await post(`42["onFts-reload",{"sid":"${RAPID_SID}","uid":"","provider":"${provider}","route":"${route}"}]`);
+  // 3. poll for the response
+  await new Promise(r => setTimeout(r, 1500));
+  const pollRes = await fetch(`${RAPID_URL}?EIO=4&transport=polling&sid=${sid}&t=${Date.now()}`, {
+    headers: { "user-agent": UA },
+  });
+  if (!pollRes.ok) throw new Error(`rapid poll ${pollRes.status}`);
+  const pollText = await pollRes.text();
+  // frames split by \x1e; find the 42["onFts-client",...] frame
+  let payload = null;
+  for (const frame of pollText.split("\x1e")) {
+    const fm = frame.match(/^42\["onFts-client","(.*)"\]$/, "s");
+    if (fm) { payload = fm[1]; break; }
+  }
+  if (!payload) throw new Error(`no onFts-client frame in poll (${pollText.slice(0, 60)})`);
+  // payload is base64(gzip(json)) — decompress in the Worker
+  const ds = new DecompressionStream("gzip");
+  const stream = new Blob([b64decode(payload)]).stream().pipeThrough(ds);
+  const text = new TextDecoder().decode(await new Response(stream).arrayBuffer());
+  return JSON.parse(text);
+}
+
+async function rapidBusLive(provider, route) {
+  const data = await rapidBusFeed(provider, route || "");
+  const buses = Array.isArray(data) ? data : [];
+  return {
+    provider,
+    route: route || "all",
+    live_buses: buses.length,
+    updated: new Date().toISOString(),
+    buses: buses.slice(0, 200).map(b => ({
+      bus_no: b.bus_no, latitude: b.latitude, longitude: b.longitude,
+      route: b.route, dir: b.dir, speed: b.speed, angle: b.angle,
+      dt_gps: b.dt_gps, trip_no: b.trip_no, accessibility: b.accessibility,
+    })),
+  };
+}
+
 /* ---- MCP tool catalogue (mirrors the stdio plugin server) ---- */
 const RO = { readOnlyHint: true, openWorldHint: false, destructiveHint: false };
 const TOOLS = [
@@ -318,12 +398,28 @@ const TOOLS = [
     name: "mygov_gtfs_realtime",
     description: "Live vehicle positions (GTFS-realtime protobuf). Agencies: ktmb, "
       + "prasarana (category rapid-bus-kl / rapid-rail-kl), mybas-*. "
-      + "Returns count + vehicle id/lat/lon list.",
+      + "Returns count + vehicle id/lat/lon list. NOTE: the prasarana GTFS-RT feed "
+      + "is often empty — use mygov_rapid_bus_live for actual Rapid KL bus positions.",
     inputSchema: {
       type: "object",
       properties: {
         agency: { type: "string", description: "ktmb, prasarana, or mybas-*" },
         category: { type: "string", description: "For prasarana: rapid-bus-kl, rapid-rail-kl, ..." },
+      },
+    },
+    annotations: RO,
+  },
+  {
+    name: "mygov_rapid_bus_live",
+    description: "Live Rapid KL / Rapid Penang / Rapid Kuantan bus positions from the "
+      + "official myrapidbus kiosk feed (800+ buses). Providers: RKL (Klang Valley), "
+      + "RPG (Penang), RKN (Kuantan). Optional route filter (e.g. T2000, 300). "
+      + "Returns bus_no, lat/lon, route, speed, direction, last GPS time.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        provider: { type: "string", description: "RKL, RPG, or RKN (default RKL)" },
+        route: { type: "string", description: "Optional route number filter" },
       },
     },
     annotations: RO,
@@ -342,6 +438,7 @@ const TTL = {
   "mygov_opendosm": 43200,             // CPI quarterly, IPI monthly
   "mygov_gtfs_static_summary": 43200,  // schedules republished daily
   "mygov_gtfs_realtime": 0,            // live positions — never cached
+  "mygov_rapid_bus_live": 0,           // live kiosk feed — never cached
 };
 
 async function callTool(name, args) {
@@ -383,6 +480,13 @@ async function callTool(name, args) {
     const data = await apiGet(path, a.category ? { category: a.category } : {}, 0);
     const vehicles = parseFeedMessage(data);
     return { agency: a.agency || "ktmb", live_vehicles: vehicles.length, vehicles: vehicles.slice(0, 100) };
+  }
+  if (name === "mygov_rapid_bus_live") {
+    const provider = String(a.provider || "RKL").toUpperCase();
+    if (!["RKL", "RPG", "RKN"].includes(provider)) {
+      throw new Error(`unknown provider ${provider} (use RKL, RPG, or RKN)`);
+    }
+    return rapidBusLive(provider, String(a.route || ""));
   }
   throw new Error(`Unknown tool: ${name}`);
 }
