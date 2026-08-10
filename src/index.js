@@ -438,6 +438,23 @@ const TOOLS = [
     },
     annotations: RO,
   },
+  {
+    name: "mygov_pricecatcher",
+    description: "Malaysia grocery price index (KPDN PriceCatcher, 198-item basket). "
+      + "Search items by name (e.g. TOMATO, RICE, ONION) or filter by group "
+      + "(BARANGAN SEGAR, MAKANAN KERING, MINUMAN...). Returns each item's current "
+      + "price, unit, month-on-month and year-on-year change, plus the 13-month "
+      + "price history. Updated daily by the dashboard's PriceCatcher collector.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        item: { type: "string", description: "Item name substring search (case-insensitive)" },
+        group: { type: "string", description: "Optional item group filter, e.g. BARANGAN SEGAR" },
+        limit: { type: "integer", description: "Max items to return (default 20, max 1000)" },
+      },
+    },
+    annotations: RO,
+  },
 ];
 
 /* ---- tool dispatch ---- */
@@ -454,6 +471,7 @@ const TTL = {
   "mygov_gtfs_realtime": 0,            // live positions — never cached
   "mygov_rapid_bus_live": 0,           // live kiosk feed — never cached
   "mygov_flood_risk": 300,             // JPS telemetry updates every 15 min
+  "mygov_pricecatcher": 3600,          // collector runs daily at 13:30 UTC
 };
 
 async function callTool(name, args) {
@@ -535,6 +553,35 @@ async function callTool(name, args) {
       at_risk: data.at_risk,
       states: data.states,
       stations: data.stations,
+    };
+  }
+  if (name === "mygov_pricecatcher") {
+    const PRICES = "https://mygov.faizalmzain.com/prices.json";
+    let res;
+    try {
+      res = await fetch(PRICES, { headers: { "user-agent": UA }, cf: { cacheTtl: ttl } });
+    } catch {
+      throw new Error("pricecatcher upstream unreachable");
+    }
+    if (!res.ok) throw new Error(`pricecatcher upstream error ${res.status}`);
+    const data = await res.json();
+    const q = String(a.item || "").trim().toLowerCase();
+    const grp = String(a.group || "").trim().toUpperCase();
+    const lim = clampLimit(a.limit || 20);
+    let items = Array.isArray(data.items) ? data.items : [];
+    if (q) items = items.filter(it => String(it.n || "").toLowerCase().includes(q));
+    if (grp) items = items.filter(it => String(it.g || "") === grp);
+    items = items.slice(0, lim).map(it => ({
+      item: it.n, unit: it.u, group: it.g, kind: it.k,
+      latest_price: it.p && it.p.length ? it.p[it.p.length - 1] : null,
+      mom_pct: it.mom, yoy_pct: it.yoy,
+      price_history: (it.p || []).map((v, i) => ({ month: data.months[i], price: v })),
+    }));
+    return {
+      generated: data.generated, as_of: data.asOf,
+      months: data.months,
+      basket: data.basket ? { n: data.basket.n, base: data.basket.base, national_index: data.basket.national } : null,
+      items,
     };
   }
   throw new Error(`Unknown tool: ${name}`);
