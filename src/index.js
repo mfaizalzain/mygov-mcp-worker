@@ -207,6 +207,7 @@ function zipReadEntry(buf, name) {
 }
 
 async function gtfsStaticSummary(agency, ttl = 0) {
+  if (!/^[a-z0-9-]{1,32}$/.test(agency)) throw new Error("invalid agency");
   const category = agency.startsWith("prasarana") ? "rapid-bus-kl" : null;
   const data = await apiGet(`/gtfs-static/${agency}`, category ? { category } : {}, ttl);
   const summary = { agency, files: [] };
@@ -444,9 +445,15 @@ const TTL = {
 async function callTool(name, args) {
   const a = args || {};
   const ttl = TTL[name] || 0;
+  /* Arbitrary client-supplied limits must not be able to force a giant
+     upstream fetch (and its cached copy). Clamp to a sane maximum. */
+  const clampLimit = v => {
+    const n = Number(v);
+    return Number.isFinite(n) ? Math.min(Math.max(Math.floor(n), 1), 1000) : 100;
+  };
   if (name === "mygov_weather_forecast") {
     await throttle("weather");
-    const params = { limit: 200 };
+    const params = { limit: clampLimit(a.limit || 200) };
     if (a.location) params.contains = `${a.location}@location__location_name`;
     return apiGet("/weather/forecast", params, ttl);
   }
@@ -456,7 +463,7 @@ async function callTool(name, args) {
   }
   if (name === "mygov_data_catalogue") {
     await throttle("data-catalogue");
-    const params = { id: a.dataset_id || "", limit: a.limit || 100 };
+    const params = { id: a.dataset_id || "", limit: clampLimit(a.limit || 100) };
     for (const k of ["filter", "contains", "sort", "date_start", "date_end"]) {
       if (a[k]) params[k] = a[k];
     }
@@ -464,7 +471,7 @@ async function callTool(name, args) {
   }
   if (name === "mygov_opendosm") {
     await throttle("opendosm");
-    const params = { id: a.dataset_id || "", limit: a.limit || 100 };
+    const params = { id: a.dataset_id || "", limit: clampLimit(a.limit || 100) };
     for (const k of ["filter", "sort", "date_start", "date_end"]) {
       if (a[k]) params[k] = a[k];
     }
@@ -476,17 +483,25 @@ async function callTool(name, args) {
   }
   if (name === "mygov_gtfs_realtime") {
     await throttle("gtfs");
-    const path = `/gtfs-realtime/vehicle-position/${a.agency || "ktmb"}`;
-    const data = await apiGet(path, a.category ? { category: a.category } : {}, 0);
+    const agency = String(a.agency || "ktmb");
+    if (!/^[a-z0-9-]{1,32}$/.test(agency)) throw new Error("invalid agency");
+    const category = a.category ? String(a.category) : "";
+    if (category && !/^[a-z0-9-]{1,32}$/.test(category)) throw new Error("invalid category");
+    const path = `/gtfs-realtime/vehicle-position/${agency}`;
+    const data = await apiGet(path, category ? { category } : {}, 0);
     const vehicles = parseFeedMessage(data);
-    return { agency: a.agency || "ktmb", live_vehicles: vehicles.length, vehicles: vehicles.slice(0, 100) };
+    return { agency, live_vehicles: vehicles.length, vehicles: vehicles.slice(0, 100) };
   }
   if (name === "mygov_rapid_bus_live") {
     const provider = String(a.provider || "RKL").toUpperCase();
     if (!["RKL", "RPG", "RKN"].includes(provider)) {
       throw new Error(`unknown provider ${provider} (use RKL, RPG, or RKN)`);
     }
-    return rapidBusLive(provider, String(a.route || ""));
+    // route is interpolated into the kiosk's engine.io emit payload - keep it
+    // to the alphanumeric-dash shape a real route id has.
+    const route = String(a.route || "");
+    if (route && !/^[A-Za-z0-9-]{1,16}$/.test(route)) throw new Error("invalid route");
+    return rapidBusLive(provider, route);
   }
   throw new Error(`Unknown tool: ${name}`);
 }
