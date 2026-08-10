@@ -425,6 +425,19 @@ const TOOLS = [
     },
     annotations: RO,
   },
+  {
+    name: "mygov_flood_risk",
+    description: "Live flood risk from JPS (Department of Irrigation and Drainage) "
+      + "water-level telemetry. Returns stations currently at danger/warning/alert "
+      + "(only gauges that reported within the last 24h - dead gauges excluded), "
+      + "each with name, state, district, lat/lon, water level, danger threshold, "
+      + "trend and last reading time, plus a per-state count summary.",
+    inputSchema: {
+      type: "object",
+      properties: {},
+    },
+    annotations: RO,
+  },
 ];
 
 /* ---- tool dispatch ---- */
@@ -440,6 +453,7 @@ const TTL = {
   "mygov_gtfs_static_summary": 43200,  // schedules republished daily
   "mygov_gtfs_realtime": 0,            // live positions — never cached
   "mygov_rapid_bus_live": 0,           // live kiosk feed — never cached
+  "mygov_flood_risk": 300,             // JPS telemetry updates every 15 min
 };
 
 async function callTool(name, args) {
@@ -502,6 +516,26 @@ async function callTool(name, args) {
     const route = String(a.route || "");
     if (route && !/^[A-Za-z0-9-]{1,16}$/.test(route)) throw new Error("invalid route");
     return rapidBusLive(provider, route);
+  }
+  if (name === "mygov_flood_risk") {
+    // Proxy the dashboard's /api/flood route: same JPS feed, same slimming
+    // (danger/warning/alert + 24h freshness), so agents get the identical
+    // picture the dashboard shows.
+    const FEED = "https://mygov.faizalmzain.com/api/flood";
+    let res;
+    try {
+      res = await fetch(FEED, { headers: { "user-agent": UA }, cf: { cacheTtl: ttl } });
+    } catch {
+      throw new Error("flood upstream unreachable");
+    }
+    if (!res.ok) throw new Error(`flood upstream error ${res.status}`);
+    const data = await res.json();
+    return {
+      updated: data.updated,
+      at_risk: data.at_risk,
+      states: data.states,
+      stations: data.stations,
+    };
   }
   throw new Error(`Unknown tool: ${name}`);
 }
