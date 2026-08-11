@@ -455,6 +455,23 @@ const TOOLS = [
     },
     annotations: RO,
   },
+  {
+    name: "mygov_tourism_arrivals",
+    description: "Malaysia monthly international visitor arrivals by country of "
+      + "nationality (Tourism Malaysia, top 51). Returns the month's total, "
+      + "month-on-month and year-on-year growth vs 2025 and 2019, plus the "
+      + "year-to-date picture. Optional country filter (e.g. SINGAPORE, CHINA) "
+      + "and limit. Data updates monthly (~1 month lag); use for tourism "
+      + "demand, recovery vs pre-pandemic 2019, and top source markets.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        country: { type: "string", description: "Country/nationality filter, case-insensitive substring (e.g. SINGAPORE, CHINA, INDIA)" },
+        limit: { type: "integer", description: "Max countries to return (1-100, default 10)", minimum: 1, maximum: 100 },
+      },
+    },
+    annotations: RO,
+  },
 ];
 
 /* ---- tool dispatch ---- */
@@ -472,6 +489,7 @@ const TTL = {
   "mygov_rapid_bus_live": 0,           // live kiosk feed — never cached
   "mygov_flood_risk": 300,             // JPS telemetry updates every 15 min
   "mygov_pricecatcher": 3600,          // collector runs daily at 13:30 UTC
+  "mygov_tourism_arrivals": 86400,     // collector runs monthly on the 2nd
 };
 
 async function callTool(name, args) {
@@ -582,6 +600,32 @@ async function callTool(name, args) {
       months: data.months,
       basket: data.basket ? { n: data.basket.n, base: data.basket.base, national_index: data.basket.national } : null,
       items,
+    };
+  }
+  if (name === "mygov_tourism_arrivals") {
+    const TOUR = "https://mygov.faizalmzain.com/tourism.json";
+    let res;
+    try {
+      res = await fetch(TOUR, { headers: { "user-agent": UA }, cf: { cacheTtl: ttl } });
+    } catch {
+      throw new Error("tourism upstream unreachable");
+    }
+    if (!res.ok) throw new Error(`tourism upstream error ${res.status}`);
+    const data = await res.json();
+    const q = String(a.country || "").trim().toLowerCase();
+    const lim = clampLimit(a.limit || 10);
+    let rows = Array.isArray(data.visitor) ? data.visitor : [];
+    if (q) rows = rows.filter(r => String(r.country || "").toLowerCase().includes(q));
+    rows = rows.slice(0, lim).map(r => ({
+      rank: r.rank, country: r.country,
+      arrivals: r.cur, prev_month: r.prev,
+      yoy_pct: r.g_yoy, vs_2019_pct: r.g_2019, mom_pct: r.g_mom,
+      ytd_arrivals: r.ytd26, ytd_yoy_pct: r.gy_yoy,
+    }));
+    return {
+      as_of: data.asOf, generated: data.generated,
+      totals: data.totals,
+      countries: rows,
     };
   }
   throw new Error(`Unknown tool: ${name}`);
