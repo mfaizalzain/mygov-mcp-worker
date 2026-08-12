@@ -20,7 +20,7 @@ submission portal scans.
 - `GET /.well-known/openai-apps-challenge` - OpenAI domain verification
   (serves the token from the `OPENAI_CHALLENGE_TOKEN` secret; 404 until set)
 
-## Tools (14, all read-only, `readOnlyHint: true`)
+## Tools (17, all read-only, `readOnlyHint: true`)
 
 mygov_weather_forecast, mygov_weather_warning, mygov_data_catalogue,
 mygov_opendosm, mygov_gtfs_static_summary, mygov_gtfs_realtime,
@@ -28,12 +28,18 @@ mygov_rapid_bus_live, mygov_flood_risk, mygov_pricecatcher,
 mygov_tourism_arrivals, mygov_rapid_service_alert, mygov_air_quality,
 mygov_hotel_performance (quarterly hotel occupancy/room rate/guests by state,
 Tourism Malaysia), mygov_election_results (latest SPR election results:
-PRU-15, state elections for all 13 states, latest by-election).
+PRU-15, state elections for all 13 states, latest by-election),
+mygov_search (find datasets across the data.gov.my + OpenDOSM catalogues by
+topic — 470+ datasets, ranked by id/title/category/description match),
+mygov_health (server + upstream status; `probe=true` tests every source with
+per-source latency), mygov_dataset_info (publisher metadata for one dataset:
+last update, next update due, columns, latest row).
 
-The four newest tools proxy the dashboard's collected static files
+The dashboard-backed tools proxy the dashboard's collected static files
 (`rapid_alerts.json`, `/api/aqi`, `hotel.json`, `election.json`) with the same
 edge-cache TTLs the live tools use — agents see exactly what the dashboard
-shows.
+shows. The catalogue tools (`mygov_search`, `mygov_dataset_info`) parse the
+portals' `__NEXT_DATA__` blobs, the same way the stdio plugin server does.
 
 ## Local development
 

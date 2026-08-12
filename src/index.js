@@ -323,6 +323,159 @@ async function rapidBusLive(provider, route) {
   };
 }
 
+/* ---- dataset discovery (mygov_search) ---- */
+// Neither portal publishes a machine-readable index of its catalogue, but both
+// are Next.js apps that embed the whole catalogue in the page's __NEXT_DATA__
+// blob. Parsing that is the only way to answer "what data exists about X?"
+// without hard-coding a list that goes stale. If the portals change shape this
+// degrades to an error rather than wrong answers.
+const CATALOGUE_PAGES = {
+  "data-catalogue": "https://data.gov.my/data-catalogue",
+  "opendosm": "https://open.dosm.gov.my/data-catalogue",
+};
+const CATALOGUE_APIS = {
+  "data-catalogue": "/data-catalogue",
+  "opendosm": "/opendosm",
+};
+const NEXT_DATA_RE = /<script id="__NEXT_DATA__" type="application\/json">([\s\S]*?)<\/script>/;
+const TOKEN_RE = /[a-z0-9]+/g;
+const STOPWORDS = new Set(["a","an","and","as","at","by","for","from","in","of",
+  "on","or","per","the","to","with","data","dataset","malaysia","malaysian"]);
+
+const tokens = t => (String(t || "").toLowerCase().match(TOKEN_RE) || []);
+const queryTerms = q => {
+  const t = tokens(q).filter(x => !STOPWORDS.has(x));
+  return t.length ? t : tokens(q);  // a query of pure filler still deserves an answer
+};
+
+async function getCatalogueIndex(api) {
+  const url = CATALOGUE_PAGES[api];
+  const res = await fetch(url, { headers: { "user-agent": UA } });
+  if (!res.ok) throw new Error(`catalogue index ${res.status}`);
+  const body = await res.text();
+  const m = body.match(NEXT_DATA_RE);
+  if (!m) throw new Error("catalogue index unavailable (portal structure changed)");
+  let collection;
+  try { collection = JSON.parse(m[1]).props.pageProps.collection || {}; }
+  catch { throw new Error("catalogue index parse failed"); }
+  const out = [];
+  for (const [category, subcats] of Object.entries(collection)) {
+    for (const [subcategory, rows] of Object.entries(subcats || {})) {
+      for (const row of rows || []) {
+        if (!row.id) continue;
+        out.push({
+          dataset_id: row.id, title: row.title, description: row.description,
+          category, subcategory, publisher: row.data_source,
+          data_as_of: row.data_as_of, api,
+        });
+      }
+    }
+  }
+  return out;
+}
+
+async function searchDatasets(query, api) {
+  const terms = queryTerms(query);
+  if (!terms.length) throw new Error("query must contain at least one word");
+  const apis = api ? [api] : Object.keys(CATALOGUE_PAGES);
+  let datasets = [];
+  for (const n of apis) datasets = datasets.concat(await getCatalogueIndex(n));
+  // Same dataset is often listed on both portals; keep one entry per id.
+  const seen = new Set(), unique = [];
+  for (const d of datasets) {
+    if (seen.has(d.dataset_id)) continue;
+    seen.add(d.dataset_id); unique.push(d);
+  }
+  const scored = [];
+  for (const d of unique) {
+    const title = new Set(tokens(d.title));
+    const ident = new Set(tokens(d.dataset_id));
+    const topic = new Set([...tokens(d.category), ...tokens(d.subcategory)]);
+    const body = new Set(tokens(d.description));
+    let score = 0, matched = 0;
+    for (const term of terms) {
+      let hit = 0;
+      if (ident.has(term)) hit += 4;
+      if (title.has(term)) hit += 3;
+      if (topic.has(term)) hit += 2;
+      if (body.has(term)) hit += 1;
+      if (!hit) {  // prefix match catches plurals and partial words
+        if ([...title, ...ident].some(w => w.startsWith(term))) hit += 2;
+        else if ([...topic, ...body].some(w => w.startsWith(term))) hit += 1;
+      }
+      if (hit) matched++;
+      score += hit;
+    }
+    if (!score) continue;
+    scored.push([matched, score, d]);
+  }
+  scored.sort((a, b) => b[0] - a[0] || b[1] - a[1] || a[2].dataset_id.localeCompare(b[2].dataset_id));
+  const hits = scored.map(([matched, score, d]) => ({ ...d, relevance: { terms_matched: matched, score } }));
+  const context = {};
+  if (!hits.length) {
+    context.note = `No dataset in the ${apis.join("/")} catalogue matches '${query}'. `
+      + "These portals do not cover every subject — the data may be published by an "
+      + "agency directly, or not at all. Try a broader term before concluding it is missing.";
+    context.available_categories = [...new Set(unique.map(d => d.category))].sort();
+  }
+  return [hits, context];
+}
+
+/* ---- health probes (mygov_health) ---- */
+// Cheapest request that proves a source answers. Nothing here exposes
+// credentials or internals — the same public endpoints the tools call.
+const PROBES = {
+  "data_gov": ["https://api.data.gov.my/data-catalogue?id=fuelprice&limit=1",
+               ["mygov_data_catalogue", "mygov_opendosm", "mygov_dataset_info"]],
+  "weather": ["https://api.data.gov.my/weather/warning",
+              ["mygov_weather_forecast", "mygov_weather_warning"]],
+  "catalogue_index": ["https://data.gov.my/data-catalogue", ["mygov_search"]],
+  "flood": ["https://malaysia-at-a-glance.com/api/flood", ["mygov_flood_risk"]],
+  "aqi": ["https://malaysia-at-a-glance.com/api/aqi", ["mygov_air_quality"]],
+  "prices": ["https://malaysia-at-a-glance.com/prices.json", ["mygov_pricecatcher"]],
+  "tourism": ["https://malaysia-at-a-glance.com/tourism.json", ["mygov_tourism_arrivals"]],
+  "hotel": ["https://malaysia-at-a-glance.com/hotel.json", ["mygov_hotel_performance"]],
+  "election": ["https://malaysia-at-a-glance.com/election.json", ["mygov_election_results"]],
+  "rapid_alert": ["https://malaysia-at-a-glance.com/rapid_alerts.json", ["mygov_rapid_service_alert"]],
+  "rapid_bus": ["https://rapidbus-socketio-avl.prasarana.com.my/socket.io/?EIO=4&transport=polling",
+                ["mygov_rapid_bus_live"]],
+};
+const SERVER_VERSION = "1.2.0";
+
+async function getHealth(probe) {
+  const health = {
+    server: "healthy", version: SERVER_VERSION, tools: TOOLS.length,
+    cache: { mode: "cf-edge" }, rapid_collector: { status: "on-demand" },
+    ttl_seconds: TTL, checked_at: new Date().toISOString(),
+  };
+  if (!probe) {
+    health.sources = { status: "not_probed",
+      hint: "call again with probe=true to test each upstream (adds a few seconds)" };
+    return health;
+  }
+  const entries = await Promise.all(Object.entries(PROBES).map(async ([name, [url, tools]]) => {
+    const started = Date.now();
+    let entry;
+    try {
+      const r = await fetch(url, { headers: { "user-agent": UA } });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      await r.arrayBuffer();
+      entry = { status: "healthy" };
+    } catch (e) {
+      entry = { status: "unhealthy", message: e.message };
+    }
+    entry.latency_ms = Date.now() - started;
+    entry.affects = tools;
+    return [name, entry];
+  }));
+  const sources = Object.fromEntries(entries);
+  const unhealthy = Object.keys(sources).filter(n => sources[n].status !== "healthy");
+  health.sources = sources;
+  health.degraded = unhealthy;
+  if (unhealthy.length) health.server = "degraded";
+  return health;
+}
+
 /* ---- MCP tool catalogue (mirrors the stdio plugin server) ---- */
 const RO = { readOnlyHint: true, openWorldHint: false, destructiveHint: false };
 const TOOLS = [
@@ -524,6 +677,63 @@ const TOOLS = [
     },
     annotations: RO,
   },
+  {
+    name: "mygov_search",
+    description: "Find Malaysian government datasets by topic. Searches "
+      + "the data.gov.my and OpenDOSM catalogues (470+ datasets) and returns "
+      + "the most relevant ones with their id, title, publisher, category and "
+      + "how current they are. This is the discovery step: use it when you do "
+      + "not already know a dataset id, then pass the id you pick to "
+      + "mygov_data_catalogue or mygov_opendosm (the result's `api` field "
+      + "tells you which). Examples: query='road accidents', "
+      + "query='household income poverty', query='electricity', api='opendosm'. "
+      + "It searches dataset titles and descriptions, not the data itself.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string", minLength: 2, maxLength: 128, description: "Topic in plain words, e.g. 'road accidents', 'unemployment by state'." },
+        api: { type: "string", enum: ["data-catalogue", "opendosm"], description: "Restrict to one catalogue. Omit to search both (recommended)." },
+        limit: { type: "integer", description: "Max datasets to return (1-50, default 10)", minimum: 1, maximum: 50 },
+      },
+      required: ["query"],
+    },
+    annotations: RO,
+  },
+  {
+    name: "mygov_health",
+    description: "Server and upstream status: version, tool count, cache state "
+      + "and the freshness contract (TTL per source). By default this is "
+      + "instant and makes no network calls. Pass probe=true to test every "
+      + "upstream government source and get per-source latency plus which "
+      + "tools each one affects - use that when a tool has just failed and "
+      + "you want to know whether the source or the whole server is down.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        probe: { type: "boolean", default: false, description: "Actually contact each upstream source. Adds a few seconds." },
+      },
+    },
+    annotations: RO,
+  },
+  {
+    name: "mygov_dataset_info",
+    description: "Metadata for one data.gov.my or OpenDOSM dataset: who "
+      + "publishes it, what it is as of, when it was last updated, its update "
+      + "frequency, its column names and the latest row. Call this before "
+      + "mygov_data_catalogue / mygov_opendosm when you need to know how "
+      + "current a dataset is, or which columns you can filter and sort on. "
+      + "Examples: api='data-catalogue', dataset_id='fuelprice'; "
+      + "api='opendosm', dataset_id='cpi_core'.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        api: { type: "string", enum: ["data-catalogue", "opendosm"], default: "data-catalogue", description: "Which catalogue the dataset lives in." },
+        dataset_id: { type: "string", description: "Dataset id, e.g. fuelprice or cpi_core" },
+      },
+      required: ["dataset_id"],
+    },
+    annotations: RO,
+  },
 ];
 
 /* ---- tool dispatch ---- */
@@ -546,6 +756,9 @@ const TTL = {
   "mygov_air_quality": 900,            // Open-Meteo hourly model
   "mygov_hotel_performance": 43200,    // quarterly survey - static between quarters
   "mygov_election_results": 43200,     // results never change once published
+  "mygov_search": 86400,               // catalogue listings change rarely
+  "mygov_health": 0,                   // always fresh
+  "mygov_dataset_info": 21600,         // dataset metadata updates daily
 };
 
 async function callTool(name, args) {
@@ -788,6 +1001,54 @@ async function callTool(name, args) {
           votes: w ? w.votes : null, majority: s.majority, totalVotes: s.totalVotes,
         };
       }),
+    };
+  }
+  if (name === "mygov_search") {
+    const query = String(a.query || "").trim();
+    if (query.length < 2 || query.length > 128) {
+      throw new Error("query must be 2-128 characters");
+    }
+    const api = a.api ? String(a.api) : "";
+    if (api && !Object.keys(CATALOGUE_PAGES).includes(api)) {
+      throw new Error("api must be data-catalogue or opendosm");
+    }
+    const [hits, context] = await searchDatasets(query, api || undefined);
+    const limit = clampLimit(a.limit || 10);
+    const page = hits.slice(0, limit);
+    return {
+      query, searched: api ? [api] : Object.keys(CATALOGUE_PAGES),
+      ...context, datasets: page,
+      count: hits.length, returned: page.length, has_more: hits.length > limit,
+      next_step: "Pass a dataset_id to mygov_dataset_info for its metadata, or to "
+        + "mygov_data_catalogue / mygov_opendosm (per the `api` field) for the rows.",
+    };
+  }
+  if (name === "mygov_health") {
+    return getHealth(Boolean(a.probe));
+  }
+  if (name === "mygov_dataset_info") {
+    const api = a.api ? String(a.api) : "data-catalogue";
+    if (!Object.keys(CATALOGUE_APIS).includes(api)) {
+      throw new Error("api must be data-catalogue or opendosm");
+    }
+    const datasetId = String(a.dataset_id || "").trim();
+    if (!datasetId) throw new Error("dataset_id is required");
+    await throttle(api);
+    const payload = await apiGet(CATALOGUE_APIS[api],
+      { id: datasetId, limit: 1, meta: "true", sort: "-date" }, ttl);
+    if (!payload || typeof payload !== "object" || !("meta" in payload)) {
+      throw new Error(`not_found: ${api} has no dataset with id '${datasetId}'`);
+    }
+    const meta = payload.meta || {};
+    const sample = (payload.data || [])[0] || {};
+    return {
+      api, dataset_id: meta.catalogue_id || datasetId,
+      publisher: meta.data_source, data_as_of: meta.data_as_of,
+      last_updated: meta.last_updated, next_update: meta.next_update,
+      update_frequency: meta.update_frequency,
+      columns: Object.keys(sample).sort(), latest_row: sample || null,
+      source_url: `https://api.data.gov.my${CATALOGUE_APIS[api]}?id=${datasetId}`,
+      note: "Row counts are not reported here - this call fetches a single row on purpose. Query the dataset itself for volume.",
     };
   }
   throw new Error(`Unknown tool: ${name}`);
