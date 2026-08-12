@@ -9,7 +9,7 @@ collected datasets as read-only tools, hosted at:
   serve the identical Worker; CORS echoes any origin, the OpenAI challenge
   token is env-based, so nothing host-specific lives in the code)
 
-Serves the same 14 tools as the bundled plugin server
+Serves the same 17 tools as the bundled plugin server
 ([mfaizalzain/mygov-mcp](https://github.com/mfaizalzain/mygov-mcp)) so ChatGPT
 Work / Codex can reach them over HTTPS — this is the URL the OpenAI plugin
 submission portal scans.
