@@ -1,12 +1,17 @@
 # mygov-mcp Worker
 
 Streamable-HTTP MCP server exposing Malaysia's Government Open API
-([api.data.gov.my](https://developer.data.gov.my)) as read-only tools, hosted at
-**https://mygov-mcp.faizalmzain.com/mcp**.
+([api.data.gov.my](https://developer.data.gov.my)) and the dashboard's
+collected datasets as read-only tools, hosted at:
 
-Serves the same 6 tools as the bundled plugin server
+- **https://mygov-mcp.faizalmzain.com/mcp** (primary)
+- **https://mcp.malaysia-at-a-glance.com/mcp** (second custom domain — both URLs
+  serve the identical Worker; CORS echoes any origin, the OpenAI challenge
+  token is env-based, so nothing host-specific lives in the code)
+
+Serves the same 14 tools as the bundled plugin server
 ([mfaizalzain/mygov-mcp](https://github.com/mfaizalzain/mygov-mcp)) so ChatGPT
-Work / Codex can reach them over HTTPS - this is the URL the OpenAI plugin
+Work / Codex can reach them over HTTPS — this is the URL the OpenAI plugin
 submission portal scans.
 
 ## Endpoints
@@ -15,10 +20,20 @@ submission portal scans.
 - `GET /.well-known/openai-apps-challenge` - OpenAI domain verification
   (serves the token from the `OPENAI_CHALLENGE_TOKEN` secret; 404 until set)
 
-## Tools (all read-only, `readOnlyHint: true`)
+## Tools (14, all read-only, `readOnlyHint: true`)
 
 mygov_weather_forecast, mygov_weather_warning, mygov_data_catalogue,
-mygov_opendosm, mygov_gtfs_static_summary, mygov_gtfs_realtime.
+mygov_opendosm, mygov_gtfs_static_summary, mygov_gtfs_realtime,
+mygov_rapid_bus_live, mygov_flood_risk, mygov_pricecatcher,
+mygov_tourism_arrivals, mygov_rapid_service_alert, mygov_air_quality,
+mygov_hotel_performance (quarterly hotel occupancy/room rate/guests by state,
+Tourism Malaysia), mygov_election_results (latest SPR election results:
+PRU-15, state elections for all 13 states, latest by-election).
+
+The four newest tools proxy the dashboard's collected static files
+(`rapid_alerts.json`, `/api/aqi`, `hotel.json`, `election.json`) with the same
+edge-cache TTLs the live tools use — agents see exactly what the dashboard
+shows.
 
 ## Local development
 
@@ -40,7 +55,7 @@ curl -s -X POST http://127.0.0.1:8789/mcp \
 ## Deploy
 
 ```bash
-npx wrangler deploy   # creates the mygov-mcp.faizalmzain.com custom domain
+npx wrangler deploy   # custom domains: mygov-mcp.faizalmzain.com + mcp.malaysia-at-a-glance.com
 ```
 
 Set the OpenAI challenge token (when the submission portal provides one):
@@ -57,3 +72,6 @@ npx wrangler secret put OPENAI_CHALLENGE_TOKEN
   protobuf is parsed with a hand-rolled wire parser (no dependencies, matching
   the stdio server's stdlib-only design).
 - CORS is open so browser-based MCP clients can call it directly.
+- Keep the tool catalogue byte-consistent with the stdio plugin server
+  (`mygov-mcp/codex-mygov/servers/server.py` + `claude-mygov/servers/server.py`)
+  — the Worker mirrors it in JS.

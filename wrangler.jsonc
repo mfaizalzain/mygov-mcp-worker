@@ -5,7 +5,8 @@
   "compatibility_date": "2026-08-01",
   "compatibility_flags": ["nodejs_compat"],
   "routes": [
-    { "pattern": "mygov-mcp.faizalmzain.com", "custom_domain": true }
+    { "pattern": "mygov-mcp.faizalmzain.com", "custom_domain": true },
+    { "pattern": "mcp.malaysia-at-a-glance.com", "custom_domain": true }
   ],
   "workers_dev": true,
   "observability": {

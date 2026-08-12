@@ -472,6 +472,58 @@ const TOOLS = [
     },
     annotations: RO,
   },
+  {
+    name: "mygov_rapid_service_alert",
+    description: "Latest Rapid KL service alert (LRT/MRT/monorail/bus disruption, "
+      + "myrapid.com.my PULSE). Returns the newest post only: title, excerpt, "
+      + "link, posted time. Source is behind Incapsula; collected via the "
+      + "dashboard every 10 min.",
+    inputSchema: { type: "object", properties: {} },
+    annotations: RO,
+  },
+  {
+    name: "mygov_air_quality",
+    description: "Live air quality index (US AQI) for 18 major Malaysian cities "
+      + "(Open-Meteo hourly model). Returns every city's AQI and PM2.5 sorted "
+      + "worst-first, plus the cleanest station for comparison. US AQI 101+ "
+      + "(Unhealthy) is the haze alert threshold.",
+    inputSchema: { type: "object", properties: {} },
+    annotations: RO,
+  },
+  {
+    name: "mygov_hotel_performance",
+    description: "Quarterly hotel performance by state from Tourism Malaysia's Paid "
+      + "Accommodation Survey (via the dashboard): occupancy rate (AOR), "
+      + "average room rate (ARR) and hotel guests (domestic/international) "
+      + "for all 16 states, current quarter vs a year earlier. Optional "
+      + "state filter (e.g. 'Pahang'). Only the latest quarter is public "
+      + "on the source portal.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        state: { type: "string", description: "Optional state name filter, e.g. 'Pahang' or 'Kuala Lumpur'" },
+      },
+    },
+    annotations: RO,
+  },
+  {
+    name: "mygov_election_results",
+    description: "Latest election results from SPR (Suruhanjaya Pilihan Raya): "
+      + "PRU-15 parliamentary (208 seats), the latest state election for "
+      + "every state (600 DUN seats) or the latest by-election. Optional "
+      + "category (pru/dun/prk), state (e.g. 'KEDAH') and free-text query "
+      + "matched against constituency, winner or party name. Results are "
+      + "static once published.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        category: { type: "string", description: "pru, dun or prk" },
+        state: { type: "string", description: "State name filter, e.g. 'KEDAH'" },
+        query: { type: "string", description: "Free text: constituency, winner or party" },
+      },
+    },
+    annotations: RO,
+  },
 ];
 
 /* ---- tool dispatch ---- */
@@ -490,6 +542,10 @@ const TTL = {
   "mygov_flood_risk": 300,             // JPS telemetry updates every 15 min
   "mygov_pricecatcher": 3600,          // collector runs daily at 13:30 UTC
   "mygov_tourism_arrivals": 86400,     // collector runs monthly on the 2nd
+  "mygov_rapid_service_alert": 600,    // collector runs every 10 min
+  "mygov_air_quality": 900,            // Open-Meteo hourly model
+  "mygov_hotel_performance": 43200,    // quarterly survey - static between quarters
+  "mygov_election_results": 43200,     // results never change once published
 };
 
 async function callTool(name, args) {
@@ -557,7 +613,7 @@ async function callTool(name, args) {
     // Proxy the dashboard's /api/flood route: same JPS feed, same slimming
     // (danger/warning/alert + 24h freshness), so agents get the identical
     // picture the dashboard shows.
-    const FEED = "https://mygov.faizalmzain.com/api/flood";
+    const FEED = "https://malaysia-at-a-glance.com/api/flood";
     let res;
     try {
       res = await fetch(FEED, { headers: { "user-agent": UA }, cf: { cacheTtl: ttl } });
@@ -574,7 +630,7 @@ async function callTool(name, args) {
     };
   }
   if (name === "mygov_pricecatcher") {
-    const PRICES = "https://mygov.faizalmzain.com/prices.json";
+    const PRICES = "https://malaysia-at-a-glance.com/prices.json";
     let res;
     try {
       res = await fetch(PRICES, { headers: { "user-agent": UA }, cf: { cacheTtl: ttl } });
@@ -603,7 +659,7 @@ async function callTool(name, args) {
     };
   }
   if (name === "mygov_tourism_arrivals") {
-    const TOUR = "https://mygov.faizalmzain.com/tourism.json";
+    const TOUR = "https://malaysia-at-a-glance.com/tourism.json";
     let res;
     try {
       res = await fetch(TOUR, { headers: { "user-agent": UA }, cf: { cacheTtl: ttl } });
@@ -626,6 +682,112 @@ async function callTool(name, args) {
       as_of: data.asOf, generated: data.generated,
       totals: data.totals,
       countries: rows,
+    };
+  }
+  if (name === "mygov_rapid_service_alert") {
+    // Same file the dashboard's alert deck shows: latest PULSE post only.
+    const RAPID = "https://malaysia-at-a-glance.com/rapid_alerts.json";
+    let res;
+    try {
+      res = await fetch(RAPID, { headers: { "user-agent": UA }, cf: { cacheTtl: ttl } });
+    } catch {
+      throw new Error("rapid alerts upstream unreachable");
+    }
+    if (!res.ok) throw new Error(`rapid alerts upstream error ${res.status}`);
+    const data = await res.json();
+    const latest = data.latest || {};
+    return {
+      updated: data.updated,
+      title: latest.title, excerpt: latest.excerpt,
+      url: latest.url, posted_epoch: latest.ts,
+    };
+  }
+  if (name === "mygov_air_quality") {
+    // Proxy the dashboard's /api/aqi route: same Open-Meteo model, same
+    // worst-first slim shape, so agents see what the dashboard shows.
+    const AQI = `https://malaysia-at-a-glance.com/api/aqi?cb=${Date.now()}`;
+    let res;
+    try {
+      res = await fetch(AQI, { headers: { "user-agent": UA }, cf: { cacheTtl: ttl } });
+    } catch {
+      throw new Error("air quality upstream unreachable");
+    }
+    if (!res.ok) throw new Error(`air quality upstream error ${res.status}`);
+    const data = await res.json();
+    return {
+      updated: data.updated, reading_time: data.reading_time,
+      worst: data.worst, cleanest: data.cleanest,
+      stations: data.stations || [],
+    };
+  }
+  if (name === "mygov_hotel_performance") {
+    const HOTEL = "https://malaysia-at-a-glance.com/hotel.json";
+    let res;
+    try {
+      res = await fetch(HOTEL, { headers: { "user-agent": UA }, cf: { cacheTtl: ttl } });
+    } catch {
+      throw new Error("hotel upstream unreachable");
+    }
+    if (!res.ok) throw new Error(`hotel upstream error ${res.status}`);
+    const data = await res.json();
+    const state = String(a.state || "").trim();
+    // match case-insensitively ("pahang" == "Pahang", "KUALA LUMPUR" == "Kuala Lumpur")
+    const norm = s => String(s || "").trim().toLowerCase();
+    const pick = key => {
+      let rows = Array.isArray(data[key]) ? data[key] : [];
+      if (state) rows = rows.filter(x => norm(x.state) === norm(state));
+      return rows;
+    };
+    return {
+      asOf: data.asOf, generated: data.generated, source: data.source,
+      occupancy_rate: pick("aor"), average_room_rate: pick("arr"),
+      guests: pick("guests"),
+    };
+  }
+  if (name === "mygov_election_results") {
+    const ELE = "https://malaysia-at-a-glance.com/election.json";
+    let res;
+    try {
+      res = await fetch(ELE, { headers: { "user-agent": UA }, cf: { cacheTtl: ttl } });
+    } catch {
+      throw new Error("election upstream unreachable");
+    }
+    if (!res.ok) throw new Error(`election upstream error ${res.status}`);
+    const data = await res.json();
+    let seats = Array.isArray(data.seats) ? data.seats : [];
+    const category = String(a.category || "").trim().toLowerCase();
+    if (category) {
+      if (!["pru", "dun", "prk"].includes(category)) {
+        throw new Error("category must be pru, dun or prk");
+      }
+      seats = seats.filter(s => s.category === category);
+    }
+    let state = String(a.state || "").trim().toUpperCase();
+    if (state) seats = seats.filter(s => String(s.state || "").toUpperCase() === state);
+    const q = String(a.query || "").trim().toLowerCase();
+    if (q) {
+      seats = seats.filter(s => {
+        const w = (s.candidates || []).find(c => c.isWinner);
+        const hay = [s.name, s.state, s.election,
+                     w ? w.name : "", w ? (w.partyShort || w.party) : ""]
+          .join(" ").toLowerCase();
+        return hay.includes(q);
+      });
+    }
+    const cats = {};
+    for (const [k, v] of Object.entries(data.categories || {})) cats[k] = (v || {}).name;
+    return {
+      generated: data.generated, source: data.source, note: data.note,
+      categories: cats, count: seats.length,
+      seats: seats.map(s => {
+        const w = (s.candidates || []).find(c => c.isWinner);
+        return {
+          category: s.category, state: s.state, name: s.name,
+          election: s.election, date: s.date,
+          winner: w ? w.name : null, party: w ? (w.partyShort || w.party) : null,
+          votes: w ? w.votes : null, majority: s.majority, totalVotes: s.totalVotes,
+        };
+      }),
     };
   }
   throw new Error(`Unknown tool: ${name}`);
