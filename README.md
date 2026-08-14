@@ -10,15 +10,19 @@ collected datasets as read-only tools, hosted at:
   token is env-based, so nothing host-specific lives in the code)
 
 Serves the same 17 tools as the bundled plugin server
-([mfaizalzain/mygov-mcp](https://github.com/mfaizalzain/mygov-mcp)) so ChatGPT
-Work / Codex can reach them over HTTPS — this is the URL the OpenAI plugin
-submission portal scans.
+([mfaizalzain/mygov-mcp](https://github.com/mfaizalzain/mygov-mcp)) so Google Gemini,
+ChatGPT Work, Codex, and Claude can reach them over HTTPS.
+
 
 ## Endpoints
 
 - `POST /mcp` - MCP streamable-HTTP JSON-RPC (initialize, tools/list, tools/call)
+- `GET /openapi.json` - OpenAPI 3.0 specification for Google AI Studio / Gemini Custom Apps
+- `POST /api/{tool_name}` - Direct REST tool invocation (for OpenAPI-based tools)
+- `GET /health` - Health check & upstream latency probes (`?probe=true`)
 - `GET /.well-known/openai-apps-challenge` - OpenAI domain verification
   (serves the token from the `OPENAI_CHALLENGE_TOKEN` secret; 404 until set)
+
 
 ## Tools (17, all read-only, `readOnlyHint: true`)
 

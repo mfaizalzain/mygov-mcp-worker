@@ -1087,6 +1087,67 @@ async function handleMCPMessage(msg) {
   return rpcError(id, -32601, `Method not found: ${method}`);
 }
 
+/* ---- OpenAPI 3.0 spec generator for Gemini, AI Studio & Custom Apps ---- */
+function buildOpenApiSpec(host) {
+  const paths = {};
+  for (const tool of TOOLS) {
+    paths[`/api/${tool.name}`] = {
+      post: {
+        summary: tool.name,
+        description: tool.description,
+        operationId: tool.name,
+        requestBody: {
+          required: false,
+          content: {
+            "application/json": {
+              schema: tool.inputSchema || { type: "object", properties: {} },
+            },
+          },
+        },
+        responses: {
+          "200": {
+            description: "Successful operation",
+            content: {
+              "application/json": {
+                schema: { type: "object" },
+              },
+            },
+          },
+          "400": {
+            description: "Error response",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    error: { type: "string" },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    };
+  }
+
+  return {
+    openapi: "3.0.1",
+    info: {
+      title: "mygov-mcp Open Data API",
+      description: "Malaysia Government Open Data connector for Google Gemini, Custom Apps, and MCP clients.",
+      version: "1.0.0",
+    },
+    servers: [
+      {
+        url: `https://${host}`,
+        description: "Current environment",
+      },
+    ],
+    paths,
+  };
+}
+
 /* ---- HTTP entry ---- */
 export default {
   async fetch(request, env) {
@@ -1106,6 +1167,54 @@ export default {
       });
     }
 
+    // Root info
+    if (url.pathname === "/" && request.method === "GET") {
+      return json({
+        name: "mygov-mcp",
+        description: "Malaysia Government Open Data connector (MCP & OpenAPI for Google Gemini, Claude, OpenAI)",
+        version: "1.0.0",
+        endpoints: {
+          mcp: "POST /mcp",
+          openapi: "GET /openapi.json",
+          rest_tools: "POST /api/{tool_name}",
+          health: "GET /health",
+        },
+        tools_count: TOOLS.length,
+      }, 200, { "access-control-allow-origin": origin });
+    }
+
+    // OpenAPI 3.0 specification for Google AI Studio / Gemini Custom Apps
+    if (url.pathname === "/openapi.json" && request.method === "GET") {
+      const spec = buildOpenApiSpec(url.host);
+      return json(spec, 200, { "access-control-allow-origin": origin });
+    }
+
+    // Health check
+    if (url.pathname === "/health" && request.method === "GET") {
+      const probe = url.searchParams.get("probe") === "true";
+      const health = await getHealth(probe);
+      return json(health, 200, { "access-control-allow-origin": origin });
+    }
+
+    // REST Tool Execution (POST /api/:toolName or POST /tools/:toolName)
+    if (request.method === "POST" && (url.pathname.startsWith("/api/") || url.pathname.startsWith("/tools/"))) {
+      const toolName = url.pathname.replace(/^\/(api|tools)\//, "");
+      let args = {};
+      try {
+        const text = await request.text();
+        if (text && text.trim()) args = JSON.parse(text);
+      } catch {
+        return json({ error: "invalid_json_body" }, 400, { "access-control-allow-origin": origin });
+      }
+
+      try {
+        const result = await callTool(toolName, args || {});
+        return json(result, 200, { "access-control-allow-origin": origin });
+      } catch (err) {
+        return json({ error: err.message }, 400, { "access-control-allow-origin": origin });
+      }
+    }
+
     // OpenAI domain verification (token is set as a secret: OPENAI_CHALLENGE_TOKEN)
     if (url.pathname === "/.well-known/openai-apps-challenge") {
       const token = env.OPENAI_CHALLENGE_TOKEN || "";
@@ -1116,7 +1225,10 @@ export default {
     }
 
     if (url.pathname !== "/mcp") {
-      return json({ error: "not_found", hint: "POST /mcp for MCP; /.well-known/openai-apps-challenge for domain verification" }, 404);
+      return json({
+        error: "not_found",
+        hint: "POST /mcp for MCP; GET /openapi.json for Gemini OpenAPI spec; POST /api/{tool_name} for REST"
+      }, 404);
     }
     if (request.method !== "POST") {
       return json({ error: "method_not_allowed", hint: "MCP streamable HTTP uses POST" }, 405);
@@ -1131,5 +1243,6 @@ export default {
     return json(out, 200, { "access-control-allow-origin": origin });
   },
 };
+
 
 
