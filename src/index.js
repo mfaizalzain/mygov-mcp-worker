@@ -1148,11 +1148,45 @@ function buildOpenApiSpec(host) {
   };
 }
 
+/* ---- SSE helper for MCP clients (Gemini, Claude, Inspector) ---- */
+function handleMcpSse(request, url, origin) {
+  const endpointUrl = `${url.origin}/mcp`;
+  let intervalId;
+  const stream = new ReadableStream({
+    start(controller) {
+      const encoder = new TextEncoder();
+      controller.enqueue(encoder.encode(`event: endpoint\ndata: ${endpointUrl}\n\n`));
+      intervalId = setInterval(() => {
+        try {
+          controller.enqueue(encoder.encode(`: ping\n\n`));
+        } catch {
+          clearInterval(intervalId);
+        }
+      }, 15000);
+    },
+    cancel() {
+      if (intervalId) clearInterval(intervalId);
+    },
+  });
+
+  return new Response(stream, {
+    status: 200,
+    headers: {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-cache, no-transform",
+      "connection": "keep-alive",
+      "access-control-allow-origin": origin,
+      "access-control-allow-headers": "*",
+    },
+  });
+}
+
 /* ---- HTTP entry ---- */
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     const origin = request.headers.get("origin") || "*";
+    const accept = request.headers.get("accept") || "";
 
     // CORS preflight
     if (request.method === "OPTIONS") {
@@ -1160,36 +1194,29 @@ export default {
         status: 204,
         headers: {
           "access-control-allow-origin": origin,
-          "access-control-allow-methods": "POST, GET, OPTIONS",
-          "access-control-allow-headers": "content-type, mcp-session-id, authorization",
+          "access-control-allow-methods": "POST, GET, OPTIONS, HEAD",
+          "access-control-allow-headers": "content-type, mcp-session-id, authorization, accept, x-requested-with",
           "access-control-max-age": "86400",
         },
       });
     }
 
-    // Root info
-    if (url.pathname === "/" && request.method === "GET") {
-      return json({
-        name: "mygov-mcp",
-        description: "Malaysia Government Open Data connector (MCP & OpenAPI for Google Gemini, Claude, OpenAI)",
-        version: "1.0.0",
-        endpoints: {
-          mcp: "POST /mcp",
-          openapi: "GET /openapi.json",
-          rest_tools: "POST /api/{tool_name}",
-          health: "GET /health",
-        },
-        tools_count: TOOLS.length,
-      }, 200, { "access-control-allow-origin": origin });
+    // OpenAI domain verification
+    if (url.pathname === "/.well-known/openai-apps-challenge") {
+      const token = env.OPENAI_CHALLENGE_TOKEN || "";
+      if (!token) return new Response("not configured", { status: 404 });
+      return new Response(token, {
+        headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" },
+      });
     }
 
     // OpenAPI 3.0 specification for Google AI Studio / Gemini Custom Apps
-    if (url.pathname === "/openapi.json" && request.method === "GET") {
+    if ((url.pathname === "/openapi.json" || url.pathname === "/openapi.yaml") && request.method === "GET") {
       const spec = buildOpenApiSpec(url.host);
       return json(spec, 200, { "access-control-allow-origin": origin });
     }
 
-    // Health check
+    // Health check & probe
     if (url.pathname === "/health" && request.method === "GET") {
       const probe = url.searchParams.get("probe") === "true";
       const health = await getHealth(probe);
@@ -1215,34 +1242,47 @@ export default {
       }
     }
 
-    // OpenAI domain verification (token is set as a secret: OPENAI_CHALLENGE_TOKEN)
-    if (url.pathname === "/.well-known/openai-apps-challenge") {
-      const token = env.OPENAI_CHALLENGE_TOKEN || "";
-      if (!token) return new Response("not configured", { status: 404 });
-      return new Response(token, {
-        headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" },
-      });
+    // MCP SSE transport connection (GET /sse or GET /mcp with text/event-stream)
+    if (request.method === "GET" && (url.pathname === "/sse" || accept.includes("text/event-stream"))) {
+      return handleMcpSse(request, url, origin);
     }
 
-    if (url.pathname !== "/mcp") {
+    // MCP JSON-RPC handler (accepts POST on /mcp, /, and /sse)
+    if (request.method === "POST" && (url.pathname === "/mcp" || url.pathname === "/" || url.pathname === "/sse")) {
+      let msg;
+      try { msg = await request.json(); }
+      catch { return json({ error: "invalid_json" }, 400); }
+
+      const out = await handleMCPMessage(msg);
+      if (out === null) return new Response(null, { status: 202, headers: { "access-control-allow-origin": origin } });
+      return json(out, 200, { "access-control-allow-origin": origin });
+    }
+
+    // Root discovery & liveness GET
+    if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/mcp")) {
       return json({
-        error: "not_found",
-        hint: "POST /mcp for MCP; GET /openapi.json for Gemini OpenAPI spec; POST /api/{tool_name} for REST"
-      }, 404);
-    }
-    if (request.method !== "POST") {
-      return json({ error: "method_not_allowed", hint: "MCP streamable HTTP uses POST" }, 405);
+        name: "mygov-mcp",
+        description: "Malaysia Government Open Data connector (MCP, SSE & OpenAPI for Google Gemini, Claude, OpenAI)",
+        version: "1.0.0",
+        status: "healthy",
+        endpoints: {
+          mcp_streamable_http: "POST /mcp",
+          mcp_sse: "GET /sse",
+          openapi_spec: "GET /openapi.json",
+          rest_tools: "POST /api/{tool_name}",
+          health: "GET /health",
+        },
+        tools_count: TOOLS.length,
+      }, 200, { "access-control-allow-origin": origin });
     }
 
-    let msg;
-    try { msg = await request.json(); }
-    catch { return json({ error: "invalid_json" }, 400); }
-
-    const out = await handleMCPMessage(msg);
-    if (out === null) return new Response(null, { status: 202, headers: { "access-control-allow-origin": origin } });
-    return json(out, 200, { "access-control-allow-origin": origin });
+    return json({
+      error: "not_found",
+      hint: "POST /mcp for MCP; GET /sse for SSE; GET /openapi.json for Gemini OpenAPI spec; POST /api/{tool_name} for REST"
+    }, 404);
   },
 };
+
 
 
 
